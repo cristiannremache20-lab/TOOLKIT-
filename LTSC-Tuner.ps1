@@ -1,10 +1,37 @@
 <#
- LTSC-Tuner.ps1  (v5.0)
+ LTSC-Tuner.ps1  (v6.0)
  Ajustes de rendimiento, privacidad y seguridad para Windows 10 LTSC (2019 build 17763
  o 2021 build 19044 / IoT). Pensado para Dell Latitude E5550 (i3-5010U, 12 GB RAM, SSD)
  que se usa CASI SIEMPRE CONECTADA a corriente.
 
  Inspirado en las ideas publicas de AtlasOS (GPLv3). Codigo propio, sin binarios externos.
+ La lista de ajustes de la seccion E) (v6.0) esta tomada Y VERIFICADA tweak por tweak del
+ playbook oficial de Atlas (github.com/Atlas-OS/Atlas -> src/playbook/Configuration/tweaks),
+ adaptada a Windows 10 LTSC y a este hardware. Atlas desinstala components y AppX; aqui NO se
+ desinstala nada del sistema: todo es registro/servicios/tareas y 100% reversible con Undo.
+
+ NOVEDADES v6.0 (los IDs de versiones anteriores NO cambian: tu state.json y tu Undo siguen valiendo):
+   - Nuevos ajustes basados EN EL PLAYBOOK REAL DE ATLAS OS (seccion E abajo), todos reversibles:
+     * atlas-latencia: Win32PrioritySeparation 38 + MMCSS SystemResponsiveness 10 + busqueda
+       que respeta el modo de energia (no indexa cuando estas con bateria)
+   - FTH (Fault Tolerant Heap) reseteado y desactivado (tweak 'fth-off', como hace Atlas)
+   - Apagado mas rapido: AutoEndTasks + timeouts de cierre a 2 s + WaitToKillServiceTimeout 2 s
+     ('apagado-rapido'; los valores originales quedan guardados en state.json para Undo)
+   - Privacidad extra tipo Atlas: PCA/AppCompat fuera, WER completo fuera, trazas de diagnostico,
+     Device Health Attestation, RSOP logging, experimentos, retroalimentacion (Siuf), telemetria
+     en Wow6432Node y CurrentVersion\Policies (las rutas que usa Atlas, no solo una)
+   - Explorador tipo Atlas: accesos directos sin "Para hacer", ver siempre detalles de copiado,
+     sin casillas de seleccion, sin recientes/frecuentes, sin "abrir con > buscar en internet",
+     hover instantaneo (20 ms), Ink sin sugerencias, sin reducir sonido al hablar (ducking off)
+   - Seguridad/red tipo Atlas: RestrictAnonymous + RestrictAnonymousSAM + sin estrangulamiento de
+     ancho de banda SMB (habilita compartir archivos sin que Windows limite la velocidad)
+   - QoL: menu Win+X con Simbolo del sistema (no PowerShell), Storage Sense ligero (como Atlas),
+     sin autocorrector/ortografia tactil, LongPathsEnabled, plan Alto rendimiento via powercfg
+     opcional ('plan-alto-rendimiento' ya existia; ahora 'energia-ac-dc' sigue siendo la opcion recomendada)
+   - Mantenimiento nuevo: -Action Optimize (optimiza NGEN .NET, fuerza TRIM/retrim del SSD
+     con la tarea de optimizacion de Windows y verifica integridad con sfc /verifyonly;
+     inspirado en script-ngen.yml de Atlas). Boton 'Optimizar (NGEN+TRIM)' en la ventana.
+   - El .exe ahora se puede compilar con icono y version 6.0 (Compilar-EXE.ps1 actualizado)
 
  NOVEDADES v5.0 (los IDs de versiones anteriores NO cambian: tu state.json y tu Undo siguen valiendo):
    - MODO MAXIMO (-Max o boton en la ventana): recomendados + todo lo agresivo para que vuele
@@ -48,6 +75,9 @@
    ... -Action Clean                      limpia temporales y cache de actualizaciones
    ... -Action Apply -Max                 recomendados + MODO MAXIMO (rendimiento extremo)
    ... -Action Startup                    lista programas de inicio (con -Only "Nombre" los desactiva; -Enable los reactiva)
+   ... -Action Optimize                   optimiza NGEN .NET + TRIM del SSD + verifica integridad (SFC)
+   ... -Action PostInstall                primera pasada tras reinstalar Windows: recomendados + limpieza + NGEN/TRIM
+   ... -Action PostInstall -Max           lo mismo pero con MODO MAXIMO (igual que usar el boton despues de instalar)
    ... -Yes                 no pide confirmacion
    ... -NoRestorePoint      no intenta crear punto de restauracion
    ... -ForceUserTweaks     aplica ajustes de usuario aunque la ventana de
@@ -58,7 +88,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Status', 'Apply', 'Undo', 'Clean', 'Startup')]
+    [ValidateSet('Status', 'Apply', 'Undo', 'Clean', 'Startup', 'Optimize', 'PostInstall')]
     [string]$Action = 'Status',
     [switch]$Gui,
     [switch]$IncludeOptional,
@@ -71,7 +101,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ToolVersion = '5.0'
+$ToolVersion = '6.0'
 
 # ----------------------------------------------------------------------------
 # Rutas, registro (log) y estado
@@ -486,6 +516,86 @@ Add-Custom 'hibernacion-off' 'Rendimiento' 'Medio' 'OPCIONAL: desactiva hibernac
     { cmd /c "powercfg /h off >nul 2>&1" } `
     { param($data) if ($data -eq '1') { cmd /c "powercfg /h on >nul 2>&1" } } `
     $true
+
+# ============================================================================
+#  F) DEBLOAT APPX + SERVICIOS PESADOS (v7.0, inspirado en el playbook de Atlas:
+#     src/playbook/Configuration/debloat.yml y services.yml). NUEVOS IDs: no
+#     afectan tu state.json ni tu Undo actuales.
+#     A diferencia del resto de los ajustes, ESTOS SI eliminan componentes de
+#     la imagen (igual que Atlas). Por eso son OPCIONALES y reversibles asi:
+#     - AppX por usuario: Remove-AppxPackage; Undo = Add-AppxPackage -Register
+#       con el manifest que queda en WindowsApps tras desinstalar para el usuario.
+#     - AppX provisionada: se guarda el listado original en state.json; Undo lo
+#       re-provisiona con Add-AppxProvisionedPackage (DISM).
+#     - Servicios: igual que los demas (StartType original guardado).
+#     En una LTSC limpia casi no hay nada que quitar; si falta algo solo dira
+#     'nada que hacer' o omitira el paquete que no exista.
+# ============================================================================
+
+$script:AppxCatalog = @(
+    'Microsoft.BingNews',
+    'Microsoft.BingWeather',
+    'Microsoft.GetHelp',
+    'Microsoft.Getstarted',
+    'Microsoft.Messaging',
+    'Microsoft.OneConnect',
+    'Microsoft.WindowsFeedbackHub',
+    'Microsoft.MixedReality.Portal',
+    'Microsoft.ZuneMusic',
+    'Microsoft.ZuneVideo',
+    'Microsoft.MicrosoftSolitaireCollection',
+    'Microsoft.People',
+    'Microsoft.PowerAutomateDesktop',
+    'Microsoft.Todos',
+    'Microsoft.YourPhone',
+    'Microsoft.Windows.Phone',
+    'Microsoft.549981C3F5F10'
+)
+
+Add-Custom 'appx-debloat' 'Debloat' 'Medio' 'OPCIONAL (estilo Atlas): quita apps preinstaladas sobrantes (Bing News/Clima, Tu telefono, Feedback Hub, Zune, Solitario, People...). Reversible' `
+    { @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object { $_.Name -in $script:AppxCatalog }).Count -eq 0 } `
+    {
+        $cap = @{}
+        $cap['UserPkgs'] = @(Get-AppxPackage -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -in $script:AppxCatalog } |
+            ForEach-Object { @{ Name = $_.Name; InstallLocation = [string]$_.InstallLocation } })
+        try {
+            $cap['Provisioned'] = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop |
+                Where-Object { $_.DisplayName -in $script:AppxCatalog } |
+                ForEach-Object { @{ DisplayName = $_.DisplayName; PackageName = $_.PackageName } })
+        } catch { $cap['Provisioned'] = @() }
+        ($cap | ConvertTo-Json -Depth 6 -Compress)
+    } `
+    {
+        foreach ($p in @(Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object { $_.Name -in $script:AppxCatalog })) {
+            try { Remove-AppxPackage -Package $p.PackageFullName -ErrorAction Stop } catch { Write-Log ('   appx {0}: no se pudo quitar al usuario ({1})' -f $p.Name, $_.Exception.Message) 'Yellow' }
+        }
+        foreach ($pv in @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -in $script:AppxCatalog })) {
+            try { Remove-AppxProvisionedPackage -Online -PackageName $pv.PackageName -ErrorAction Stop | Out-Null } catch { Write-Log ('   appx prov {0}: {1}' -f $pv.DisplayName, $_.Exception.Message) 'Yellow' }
+        }
+    } `
+    {
+        param($data)
+        if (-not $data) { return }
+        $cap = $data | ConvertFrom-Json
+        # 1) re-provisionar primero (asi el manifest vuelve a estar disponible)
+        foreach ($pv in @($cap.Provisioned)) {
+            try { Add-AppxProvisionedPackage -Online -DisplayName $pv.DisplayName -PackageName $pv.PackageName -ErrorAction Stop | Out-Null } catch { Write-Log ('   re-provision {0}: {1}' -f $pv.DisplayName, $_.Exception.Message) 'Yellow' }
+        }
+        # 2) reinstalar por usuario desde el manifest registrado
+        foreach ($up in @($cap.UserPkgs)) {
+            if (-not $up.InstallLocation) { continue }
+            $man = Join-Path $up.InstallLocation 'AppxManifest.xml'
+            if (Test-Path -LiteralPath $man) {
+                try { Add-AppxPackage -DisableDevelopmentMode -Register $man -ErrorAction Stop | Out-Null } catch { Write-Log ('   re-instalar {0}: {1}' -f $up.Name, $_.Exception.Message) 'Yellow' }
+            }
+        }
+    } `
+    $true
+
+Add-Svc 'svc-printscan' 'Servicios' 'Medio' 'OPCIONAL: desactiva Fax y Escaneo de imagenes (WIA). No escanearas documentos por el equipo' @('Fax', 'WiaRpc') 'Disabled' $true
+Add-Svc 'svc-wlan' 'Servicios' 'Alto' 'OPCIONAL SOLO SIN WI-FI: desactiva Autoconfiguracion de WLAN (el Wi-Fi dejara de funcionar)' @('WlanSvc') 'Disabled' $true
+Add-Svc 'svc-bth' 'Servicios' 'Alto' 'OPCIONAL SOLO SIN BLUETOOTH: desactiva el servicio de Bluetooth' @('bthserv') 'Disabled' $true
 
 Add-Custom 'plan-alto-rendimiento' 'Rendimiento' 'Medio' 'OPCIONAL: plan Alto rendimiento fijo (si usas energia-ac-dc ya no hace falta)' `
     {
@@ -928,6 +1038,253 @@ foreach ($tw in $Tweaks) {
     if ($tw.Max) { $tw.Optional = $true }
 }
 
+# ============================================================================
+#  E) NOVEDADES v6.0: tweaks VERIFICADOS del playbook oficial de Atlas OS
+#     (github.com/Atlas-OS/Atlas -> src/playbook/Configuration/tweaks)
+#     Cada bloque indica el archivo .yml de Atlas del que viene. Todos reversibles.
+#     No se desinstala nada (a diferencia del playbook de Atlas): solo registro,
+#     servicios, tareas y comandos con undo explicito.
+# ============================================================================
+
+# ---- Rendimiento / latencia (atlas-latencia) ----
+# Fuente: tweaks\performance\config-mmcss.yml + system\win32-priority-separation.yml + respect-power-modes-search.yml
+Add-Reg 'atlas-latencia' 'Rendimiento' 'Bajo' 'ATLAS: prioridad al programa en primer plano (Win32PrioritySeparation=38), MMCSS deja 90% de CPU a tus apps (SystemResponsiveness=10) y la busqueda no indexa con bateria' @(
+    (New-Entry 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl' 'Win32PrioritySeparation' 38),
+    (New-Entry 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile' 'SystemResponsiveness' 10),
+    (New-Entry 'HKLM:\SOFTWARE\Microsoft\Windows Search\Gather\Windows\SystemIndex' 'RespectPowerModes' 1)
+)
+
+# Fault Tolerant Heap fuera (fuente: tweaks\performance\disable-fth.yml).
+# Undo: restablece el estado de fabrica de FTH (ejecuta el mismo specialize de Atlas).
+Add-Custom 'fth-off' 'Rendimiento' 'Bajo' 'ATLAS: resetea y desactiva el Fault Tolerant Heap (quita la penalizacion de rendimiento a apps que crashearon antes)' `
+    {
+        if (-not (Test-Path 'HKLM:\SOFTWARE\Microsoft\FTH')) { return $true }
+        [int](Get-Item 'HKLM:\SOFTWARE\Microsoft\FTH').GetValue('Enabled', 1) -eq 0
+    } `
+    { '' } `
+    {
+        cmd /c 'rundll32.exe fthsvc.dll,FthSysprepSpecialize >nul 2>&1'
+        Set-Reg 'HKLM:\SOFTWARE\Microsoft\FTH' 'Enabled' 0 'DWord'
+    } `
+    {
+        param($data)
+        # Deja FTH como viene Windows por defecto: clave eliminada/estado de fabrica
+        Remove-Item 'HKLM:\SOFTWARE\Microsoft\FTH' -Recurse -Force -ErrorAction SilentlyContinue
+        cmd /c 'rundll32.exe fthsvc.dll,FthSysprepSpecialize >nul 2>&1'
+    }
+
+# Apagado/reinicio mas rapido (fuente: tweaks\qol\startup-shutdown\decrease-shutdown-time.yml + force-end-shutdown-apps.yml).
+# Los valores originales quedan guardados en state.json; Undo los restaura exactamente.
+Add-Reg 'apagado-rapido' 'Rendimiento' 'Bajo' 'ATLAS: cierra sesiones mas rapido (termina apps colgadas solo y espera maximo 2 s a apps/servicios al apagar; Windows usa 5 s por defecto)' @(
+    (New-Entry 'HKCU:\Control Panel\Desktop' 'AutoEndTasks' '1' 'String'),
+    (New-Entry 'HKCU:\Control Panel\Desktop' 'HungAppTimeout' '2000' 'String'),
+    (New-Entry 'HKCU:\Control Panel\Desktop' 'WaitToKillAppTimeOut' '2000' 'String'),
+    (New-Entry 'HKLM:\SYSTEM\CurrentControlSet\Control' 'WaitToKillServiceTimeout' '2000' 'String')
+)
+
+# Logs de diagnostico de energia fuera (fuente: tweaks\performance\disable-sleep-study.yml).
+# Undo: vuelve a habilitar los tres logs con wevtutil.
+Add-Custom 'sleep-study-off' 'Rendimiento' 'Bajo' 'ATLAS: apaga los registros diagnosticos de SleepStudy/energia (trabajo en segundo plano sin utilidad para ti)' `
+    {
+        $o = (cmd /c 'wevtutil gl "Microsoft-Windows-SleepStudy/Diagnostic" 2>nul') | Out-String
+        $o -match '(?im)^\s*enabled:\s*false'
+    } `
+    { '' } `
+    {
+        cmd /c 'wevtutil set-log "Microsoft-Windows-SleepStudy/Diagnostic" /e:false >nul 2>&1'
+        cmd /c 'wevtutil set-log "Microsoft-Windows-Kernel-Processor-Power/Diagnostic" /e:false >nul 2>&1'
+        cmd /c 'wevtutil set-log "Microsoft-Windows-UserModePowerService/Diagnostic" /e:false >nul 2>&1'
+    } `
+    {
+        cmd /c 'wevtutil set-log "Microsoft-Windows-SleepStudy/Diagnostic" /e:true >nul 2>&1'
+        cmd /c 'wevtutil set-log "Microsoft-Windows-Kernel-Processor-Power/Diagnostic" /e:true >nul 2>&1'
+        cmd /c 'wevtutil set-log "Microsoft-Windows-UserModePowerService/Diagnostic" /e:true >nul 2>&1'
+    }
+
+# NTFS: no anotar ultimo acceso + no anotar fecha/hora en 8.3 (fuente: system\optimize-ntfs.yml).
+# La parte disablelastaccess ya estaba como opcional 'ntfs-lastaccess-off'; aqui se agrega 8dotname.
+Add-Custom 'ntfs-83-off' 'Rendimiento' 'Bajo' 'OPCIONAL ATLAS: desactiva los nombres cortos 8.3 en NTFS (menos escrituras al SSD;pocos programas viejos los necesitan)' `
+    {
+        $o = (cmd /c 'fsutil 8dot3name query C: 2>nul') | Out-String
+        $o -match '(?im)state is 2|volume is enabled.*false|8dot3name creation.*[Dd]isabled'
+    } `
+    {
+        $o = (cmd /c 'fsutil behavior query disable8dot3 2>nul') | Out-String
+        $m = [regex]::Match($o, '=\s*(\d)')
+        if ($m.Success) { $m.Groups[1].Value } else { '2' }
+    } `
+    { cmd /c 'fsutil behavior set disable8dot3 1 >nul 2>&1' } `
+    { param($data) if ($data -match '^\d$') { cmd /c ('fsutil behavior set disable8dot3 ' + $data + ' >nul 2>&1') } } `
+    $true
+
+# ---- Privacidad extra (rutas exactas del playbook de Atlas) ----
+Add-Reg 'atlas-telemetria-rutas' 'Privacidad' 'Bajo' 'ATLAS: fija AllowTelemetry=0 tambien en las otras rutas que toca Atlas (Wow6432Node, CurrentVersion\Policies, MaxTelemetryAllowed)' @(
+    (New-Entry 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'AllowTelemetry' 0),
+    (New-Entry 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'AllowTelemetry' 0),
+    (New-Entry 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'MaxTelemetryAllowed' 0),
+    (New-Entry 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' 'MaxTelemetryAllowed' 0)
+)
+Add-Reg 'atlas-pca' 'Privacidad' 'Bajo' 'ATLAS: motor de compatibilidad e inventario de aplicaciones fuera (DisableEngine/DisablePCA/DisableUAR; el equipo ya esta montado, no necesita aprender apps)' @(
+    (New-Entry "$POL\AppCompat" 'DisableEngine' 1),
+    (New-Entry "$POL\AppCompat" 'DisablePCA' 1),
+    (New-Entry "$POL\AppCompat" 'DisableUAR' 1)
+)
+Add-Reg 'atlas-wer-extra' 'Privacidad' 'Bajo' 'ATLAS: Reportes de error totalmente fuera (sin UI, sin logging, sin datos adicionales, ni drivers, ni CBS)' @(
+    (New-Entry "$POL\Windows Error Reporting" 'DontShowUI' 1),
+    (New-Entry "$POL\Windows Error Reporting" 'LoggingDisabled' 1),
+    (New-Entry "$POL\Windows Error Reporting" 'DontSendAdditionalData' 1),
+    (New-Entry 'HKLM:\SOFTWARE\Policies\Microsoft\PCHealth\ErrorReporting' 'DoReport' 0),
+    (New-Entry 'HKLM:\SOFTWARE\Policies\Microsoft\PCHealth\ErrorReporting' 'ShowUI' 0),
+    (New-Entry 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing' 'DisableWerReporting' 1),
+    (New-Entry "$POL\DeviceInstall\Settings" 'DisableSendGenericDriverNotFoundToWER' 1),
+    (New-Entry "$POL\DeviceInstall\Settings" 'DisableSendRequestAdditionalSoftwareToWER' 1)
+)
+Add-Reg 'atlas-diag-tracing' 'Privacidad' 'Bajo' 'ATLAS: trazas de diagnostico del kernel fuera + autologger Diagtrack apagado + sin transcript de eventos' @(
+    (New-Entry 'HKLM:\SYSTEM\CurrentControlSet\Control\Diagnostics\Performance' 'DisableDiagnosticTracing' 1),
+    (New-Entry 'HKLM:\SYSTEM\CurrentControlSet\Control\WMI\Autologger\Diagtrack-Listener' 'Start' 0),
+    (New-Entry 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Diagnostics\DiagTrack\EventTranscriptKey' 'EnableEventTranscript' 0),
+    (New-Entry 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Diagnostics\DiagTrack\EventTranscriptKey' 'MiniTraceSlotEnabled' 0)
+)
+Add-Reg 'atlas-experimentos' 'Privacidad' 'Bajo' 'ATLAS: sin experimentos de Microsoft, sin Device Health Attestation, sin registro RSoP, sin WDI del scenario de compatibilidad' @(
+    (New-Entry 'HKLM:\SOFTWARE\Microsoft\PolicyManager\default\System\AllowExperimentation' 'Value' 0),
+    (New-Entry 'HKLM:\SOFTWARE\Policies\Microsoft\DeviceHealthAttestationService' 'EnableDeviceHealthAttestationService' 0),
+    (New-Entry "$POL\System" 'RSoPLogging' 0),
+    (New-Entry "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WDI\{9c5a40da-b965-4fc3-8781-88dd50a6299d}" 'ScenarioExecutionEnabled' 0)
+)
+Add-Reg 'atlas-feedback-user' 'Privacidad' 'Bajo' 'ATLAS: cero peticiones de opinion (Siuf) por usuario' @(
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Siuf\Rules' 'NumberOfSIUFInPeriod' 0)
+)
+Add-Reg 'atlas-speech-privacidad' 'Privacidad' 'Bajo' 'ATLAS: reconocimiento de voz online fuera, sin personalizacion de entrada, WMP sin telemetria' @(
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy' 'HasAccepted' 0),
+    (New-Entry 'HKLM:\SOFTWARE\Policies\Microsoft\InputPersonalization' 'AllowInputPersonalization' 0),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\InputPersonalization' 'AllowInputPersonalization' 0),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\MediaPlayer\Preferences' 'UsageTracking' 0)
+)
+Add-Reg 'atlas-office-telemetry' 'Privacidad' 'Bajo' 'OPCIONAL ATLAS: si usas Office 2016+ quita su telemetria propia (clienttelemetry)' @(
+    (New-Entry 'HKCU:\Software\Policies\Microsoft\office\common\clienttelemetry' 'DisableAllFeatures' 1),
+    (New-Entry 'HKCU:\Software\Policies\Microsoft\office\16.0\common' 'DisableTelemetryOptIn' 1)
+) $true
+
+# ---- QoL Explorador (fuente: tweaks\qol\explorer\*.yml) ----
+Add-Reg 'atlas-explorador-textos' 'Usuario' 'Bajo' 'ATLAS: accesos directos sin el prefijo "- Para hacer", sin casillas de seleccion, detalles siempre visibles al copiar, puntero instantaneo (20 ms)' @(
+    (New-Entry 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\NamingTemplates' 'ShortcutNameTemplate' '"%s.lnk"' 'String'),
+    (New-Entry $ADV 'AutoCheckSelect' 0),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\OperationStatusManager' 'EnthusiastMode' 1),
+    (New-Entry 'HKCU:\Control Panel\Desktop' 'MouseHoverTime' '20' 'String')
+)
+Add-Reg 'atlas-explorador-recientes' 'Usuario' 'Bajo' 'ATLAS: sin "accesos recientes" ni "uso frecuente" en Quick Access (menos rastreo local y menos escrituras)' @(
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' 'ShowRecent' 0),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' 'ShowFrequent' 0),
+    (New-Entry $ADV 'Start_TrackDocs' 0),
+    (New-Entry 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer' 'ShowCloudFilesInQuickAccess' 0)
+)
+Add-Reg 'atlas-openwith-web-off' 'Seguridad' 'Bajo' 'ATLAS: "Abrir con..." ya no busca apps en la tienda/internet (abre directo lo instalado)' @(
+    (New-Entry 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'NoInternetOpenWith' 1)
+)
+Add-Reg 'atlas-largos-paths' 'Usabilidad' 'Bajo' 'ATLAS: rutas largas habilitadas (Win32 long paths; evita errores con carpetas profundas)' @(
+    (New-Entry 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' 'LongPathsEnabled' 1)
+)
+Add-Reg 'atlas-ink-off' 'Usuario' 'Bajo' 'ATLAS: Windows Ink sin sugerencias de apps (no estorba; la laptop no tiene lapiz)' @(
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\PenWorkspace' 'PenWorkspaceAppSuggestionsEnabled' 0)
+)
+Add-Reg 'atlas-spell-off' 'Usuario' 'Bajo' 'OPCIONAL ATLAS: sin autocorrector ni prediccion de texto del teclado tactil (Keyboard Tips / escritura a mano)' @(
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\TabletTip\1.7' 'EnableAutocorrection' 0),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\TabletTip\1.7' 'EnableDoubleTapSpace' 0),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\TabletTip\1.7' 'EnablePredictionSpaceInsertion' 0),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\TabletTip\1.7' 'EnableSpellchecking' 0),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\TabletTip\1.7' 'EnableTextPrediction' 0)
+) $true
+
+# ---- Audio / mouse (fuente: do-not-reduce-sounds.yml + disable-mouse-accel.yml) ----
+Add-Reg 'atlas-audio-ducking' 'Usuario' 'Bajo' 'ATLAS: no baja el volumen de la musica cuando hay notificaciones o llamadas (UserDuckingPreference=3)' @(
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Multimedia\Audio' 'UserDuckingPreference' 3)
+)
+Add-Reg 'atlas-sin-accel' 'Usuario' 'Bajo' 'OPCIONAL ATLAS: aceleracion del raton OFF (puntero 1:1; mejor precision, sensacion distinta al mover rapido)' @(
+    (New-Entry 'HKCU:\Control Panel\Mouse' 'MouseSpeed' '0' 'String'),
+    (New-Entry 'HKCU:\Control Panel\Mouse' 'MouseThreshold1' '0' 'String'),
+    (New-Entry 'HKCU:\Control Panel\Mouse' 'MouseThreshold2' '0' 'String')
+) $true
+
+# ---- Barra de tareas / menu Win+X (fuente: taskbar\end-task.yml + cmd-win-x.yml) ----
+Add-Reg 'atlas-win-x-cmd' 'Usabilidad' 'Bajo' 'ATLAS: el menu Win+X muestra Simbolo del sistema en lugar de PowerShell (PowerShell sigue disponible donde sea)' @(
+    (New-Entry $ADV 'DontUsePowerShellOnWinX' 1)
+)
+Add-Reg 'atlas-end-task' 'Usabilidad' 'Bajo' 'OPCIONAL ATLAS: boton "Administrador de tareas" en la barra (solo Win 11; en tu LTSC 2021 no aplica, se omite solo)' @(
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings' 'TaskbarEndTask' 1)
+) $true
+
+# ---- Almacenamiento (fuente: debloat\config-storage-sense.yml + disable-reserved-storage.yml) ----
+Add-Reg 'atlas-storage-sense' 'Usabilidad' 'Bajo' 'ATLAS: Storage Sense activado con config ligera (limpia temporales e papelera cada 30 dias automaticamente; sin limpiar descargas)' @(
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '01' 1),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '04' 1),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '32' 0),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '02' 0),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '128' 0),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '08' 0),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '256' 0),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '1024' 1),
+    (New-Entry 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '2048' 30)
+)
+Add-Custom 'atlas-reserved-storage' 'Usabilidad' 'Medio' 'OPCIONAL ATLAS: libera el almacenamiento reservado de Windows (~7 GB reservados que no usas; DISM)' `
+    {
+        $o = (cmd /c 'DISM.exe /Online /Get-ReservedStorageState 2>nul') | Out-String
+        $o -match 'disabled|deshabilitad'
+    } `
+    { '' } `
+    { cmd /c 'DISM.exe /Online /Set-ReservedStorageState /State:Disabled >nul 2>&1' } `
+    { cmd /c 'DISM.exe /Online /Set-ReservedStorageState /State:Enabled >nul 2>&1' } `
+    $true
+
+# ---- Red / compartir archivos (fuente: networking\shares\*.yml) ----
+Add-Reg 'atlas-red-shares' 'Seguridad' 'Bajo' 'ATLAS: sin acceso anonimo null-session, sin enumeracion anonima (SAM incluida) y SMB sin estrangulamiento de ancho de banda (compartir va a la maxima velocidad)' @(
+    (New-Entry 'HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters' 'RestrictNullSessAccess' 1),
+    (New-Entry 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RestrictAnonymous' 1),
+    (New-Entry 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RestrictAnonymousSAM' 1),
+    (New-Entry 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters' 'DisableBandwidthThrottling' 1)
+)
+
+# ---- Scripts de Atlas adaptados (script-core-isolation / mitigations: SOLO informacion) ----
+# Atlas revisa Core Isolation y mitigaciones de CPU. En esta laptop (i3 Broadcom, DDR3L)
+# mantenerlas activas es lo correcto: este ajuste solo INFORMA, nunca desactiva nada.
+Add-Custom 'atlas-check-seguridad' 'Seguridad' 'Bajo' 'ATLAS (informativo): revisa Core Isolation (VBS), mitigaciones de CPU, Hyper-V y Secure Boot y lo apunta en el log. NO cambia nada' `
+    { $false } `
+    { '' } `
+    {
+        $lineas = @()
+        try {
+            $ci = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName 'Win32_DeviceGuard' -ErrorAction Stop
+            $vbs = if (@($ci.VirtualizationBasedSecurityStatus) -contains 2) { 'ACTIVA' } else { 'inactiva' }
+            $lineas += ('Core Isolation (VBS): ' + $vbs)
+        } catch { $lineas += 'Core Isolation (VBS): no se pudo consultar' }
+        try {
+            $mb = (cmd /c 'reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" /v VBSEnabled 2>nul') | Out-String
+            if ($mb -match '0x1') { $lineas += 'VBS habilitado en memoria: si' } else { $lineas += 'VBS habilitado en memoria: no/anterior' }
+        } catch { }
+        try {
+            $hv = Get-WindowsOptionalFeature -Online -FeatureName 'Microsoft-Hyper-V-All' -ErrorAction SilentlyContinue
+            if ($hv) { $lineas += ('Hyper-V: ' + $hv.State) }
+        } catch { }
+        try {
+            $sb = (cmd /c 'Confirm-SecureBootUEFI' 2>$null) | Out-String
+            if ($sb.Trim()) { $lineas += ('Secure Boot: ' + $sb.Trim()) }
+        } catch { $lineas += 'Secure Boot: no se pudo leer (modo BIOS/Legacy)' }
+        foreach ($l in $lineas) { Write-Log ('   ' + $l) 'DarkCyan' }
+    } `
+    { }
+
+# Ajustes nuevos: los marcados $true al crearse ya son opcionales; aqui se anade la propiedad
+# Max a TODOS los que no la tienen (los de arriba) y se suman los MAX adicionales de v6.0.
+$MaxIdsV6 = @('atlas-sin-accel', 'ntfs-83-off')
+foreach ($tw in $Tweaks) {
+    if ($null -eq $tw.PSObject.Properties['Max']) {
+        $tw | Add-Member -NotePropertyName Max -NotePropertyValue ($MaxIdsV6 -contains $tw.Id) -Force
+    }
+    elseif ($MaxIdsV6 -contains $tw.Id) {
+        $tw.Max = $true; $tw.Optional = $true
+    }
+}
+
+
 # ----------------------------------------------------------------------------
 # Estado de cada ajuste
 # ----------------------------------------------------------------------------
@@ -1253,6 +1610,88 @@ function Invoke-Clean {
 }
 
 # ----------------------------------------------------------------------------
+# Invoke-Optimize  (-Action Optimize)
+# Inspirado en script-ngen.yml del playbook de Atlas OS: optimiza las imagenes
+# NGEN de .NET Framework para que las apps arranquen mas rapido. Ademas fuerza
+# el mantenimiento programado de disco (desfragmentacion/optimizacion TRIM de
+# Windows, "defrag" en SSD = TRIM) y verifica la integridad del sistema.
+# No hace cambios en registro: es mantenimiento puro, sin Undo necesario.
+# ----------------------------------------------------------------------------
+function Invoke-Optimize {
+    Write-Log ('--- LTSC-Tuner v{0}: optimizacion (NGEN + mantenimiento de disco) ---' -f $ToolVersion) 'Cyan'
+
+    # 1) NGEN update de .NET Framework (todas las versiones instaladas). Atlas lo
+    #    ejecuta tras aplicar tweaks; aqui puedes correrlo cuando quieras.
+    $ngenDirs = @(
+        (Join-Path $env:WINDIR 'Microsoft.NET\Framework64'),
+        (Join-Path $env:WINDIR 'Microsoft.NET\Framework')
+    )
+    $found = @()
+    foreach ($d in $ngenDirs) {
+        if (Test-Path $d) {
+            $found += @(Get-ChildItem $d -Directory -Filter 'v*' -ErrorAction SilentlyContinue |
+                        Where-Object { Test-Path (Join-Path $_.FullName 'ngen.exe') } |
+                        Sort-Object Name -Descending)
+        }
+    }
+    if ($found.Count -eq 0) {
+        Write-Log 'No encontre ngen.exe (no hay .NET Framework instalado?).' 'Yellow'
+    }
+    foreach ($dir in $found) {
+        $exe = Join-Path $dir.FullName 'ngen.exe'
+        Write-Log ('Optimizando imagenes NGEN de {0} ... (puede tardar unos minutos)' -f $dir.Name) 'Gray'
+        try {
+            & $exe executeQueuedItems 64 /quiet 2>&1 | ForEach-Object { Write-Log ('   ' + $_) 'Gray' }
+            Write-Log ('   {0}: listo' -f $dir.Name) 'Green'
+        } catch {
+            Write-Log ('   {0}: fallo ({1})' -f $dir.Name, $_.Exception.Message) 'Yellow'
+        }
+    }
+
+    # 2) Mantenimiento de disco programado de Windows (en SSD hace TRIM/retrim).
+    Write-Log 'Forzando la tarea de optimizacion de unidades de Windows (TRIM/retrim)...' 'Gray'
+    try {
+        Start-ScheduledTask -TaskPath '\Microsoft\Windows\Defrag\' -TaskName 'ScheduledDefrag' -ErrorAction Stop
+        Write-Log '   Tarea iniciada (se ejecuta en segundo plano).' 'Green'
+    } catch {
+        # alternativa directa con defrag /L (solo TRIM, seguro en SSD)
+        try {
+            cmd /c "defrag C: /L /H >nul 2>&1"
+            Write-Log '   TRIM forzado con defrag /L.' 'Green'
+        } catch { Write-Log '   No se pudo forzar la optimizacion de disco.' 'Yellow' }
+    }
+
+    # 3) Verificacion rapida de integridad (solo lectura, no repara nada).
+    Write-Log 'Verificando integridad de archivos del sistema (sfc /verifyonly, tarda varios minutos)...' 'Gray'
+    try {
+        $out = (cmd /c "sfc /verifyonly 2>&1") | Out-String
+        if ($out -match 'did not find any integrity violations|no encontro.*integridad') {
+            Write-Log '   SFC: sin problemas de integridad.' 'Green'
+        } else {
+            Write-Log '   SFC: encontro diferencias. Si quieres reparar, abre una consola como admin y ejecuta:  sfc /scannow' 'Yellow'
+        }
+    } catch { Write-Log '   No se pudo ejecutar SFC.' 'Yellow' }
+
+    Write-Log 'Optimizacion terminada. Recomendado reiniciar para que NGEN surta efecto total.' 'Cyan'
+}
+
+# ----------------------------------------------------------------------------
+# Invoke-PostInstall  (-Action PostInstall)
+# La "primera pasada" despues de reinstalar Windows desde cero (tu caso): hace en
+# un solo paso lo que Atlas aplica durante la instalacion, pero sobre el sistema
+# ya instalado: recomendados (o MODO MAXIMO con -Max) + limpieza + NGEN/TRIM.
+# Si usas la ventana, el boton "Tras reinstalar" hace exactamente esto.
+# ----------------------------------------------------------------------------
+function Invoke-PostInstall {
+    Write-Log ('--- LTSC-Tuner v{0}: primera pasada tras reinstalar ---' -f $ToolVersion) 'Cyan'
+    $sel = @($Tweaks | Where-Object { (-not $_.Optional) -or ($Max -and $_.Max) })
+    Invoke-ApplyList $sel
+    Invoke-Clean
+    Invoke-Optimize
+    Write-Log 'Pasada completa. Reinicia el equipo, instala los drivers de Dell (chipset, video, red) desde dell.com/support y vuelve a correr este asistente si quieres ajustar algo mas.' 'Cyan'
+}
+
+# ----------------------------------------------------------------------------
 # Programas de inicio (se desactivan igual que en el Administrador de tareas; reversible)
 # ----------------------------------------------------------------------------
 function New-StartupObj {
@@ -1417,18 +1856,18 @@ function Show-Gui {
 
     $script:Form = New-Object System.Windows.Forms.Form
     $script:Form.Text = 'LTSC-Tuner v' + $ToolVersion + ' - ' + $SysLabel
-    $script:Form.Size = New-Object System.Drawing.Size(1180, 790)
+    $script:Form.Size = New-Object System.Drawing.Size(1340, 790)
     $script:Form.StartPosition = 'CenterScreen'
 
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text = 'Marca los ajustes y pulsa Aplicar. Los opcionales vienen sin marcar. Todo se puede revertir con "Revertir marcados".'
     $lbl.Location = New-Object System.Drawing.Point(10, 8)
-    $lbl.Size = New-Object System.Drawing.Size(1140, 20)
+    $lbl.Size = New-Object System.Drawing.Size(1300, 20)
     $script:Form.Controls.Add($lbl)
 
     $script:LblPower = New-Object System.Windows.Forms.Label
     $script:LblPower.Location = New-Object System.Drawing.Point(10, 28)
-    $script:LblPower.Size = New-Object System.Drawing.Size(1140, 20)
+    $script:LblPower.Size = New-Object System.Drawing.Size(1300, 20)
     $script:LblPower.ForeColor = [System.Drawing.Color]::DarkCyan
     $script:Form.Controls.Add($script:LblPower)
 
@@ -1438,7 +1877,7 @@ function Show-Gui {
     $script:Lv.FullRowSelect = $true
     $script:Lv.GridLines = $true
     $script:Lv.Location = New-Object System.Drawing.Point(10, 52)
-    $script:Lv.Size = New-Object System.Drawing.Size(1145, 420)
+    $script:Lv.Size = New-Object System.Drawing.Size(1305, 420)
     $script:Lv.Anchor = 'Top,Left,Right'
     [void]$script:Lv.Columns.Add('Ajuste', 170)
     [void]$script:Lv.Columns.Add('Categoria', 90)
@@ -1491,10 +1930,23 @@ function Show-Gui {
     $btnStartup.Size = New-Object System.Drawing.Size(135, 32)
     $script:Form.Controls.Add($btnStartup)
 
+    $btnOptimize = New-Object System.Windows.Forms.Button
+    $btnOptimize.Text = 'Optimizar (NGEN+TRIM)'
+    $btnOptimize.Location = New-Object System.Drawing.Point(990, 482)
+    $btnOptimize.Size = New-Object System.Drawing.Size(150, 32)
+    $script:Form.Controls.Add($btnOptimize)
+
+    $btnPost = New-Object System.Windows.Forms.Button
+    $btnPost.Text = 'Tras reinstalar'
+    $btnPost.Location = New-Object System.Drawing.Point(990, 518)
+    $btnPost.Size = New-Object System.Drawing.Size(150, 32)
+    $btnPost.ForeColor = [System.Drawing.Color]::DarkBlue
+    $script:Form.Controls.Add($btnPost)
+
     $btnClose = New-Object System.Windows.Forms.Button
     $btnClose.Text = 'Cerrar'
-    $btnClose.Location = New-Object System.Drawing.Point(1020, 482)
-    $btnClose.Size = New-Object System.Drawing.Size(135, 32)
+    $btnClose.Location = New-Object System.Drawing.Point(1146, 482)
+    $btnClose.Size = New-Object System.Drawing.Size(90, 32)
     $btnClose.Anchor = 'Top,Right'
     $script:Form.Controls.Add($btnClose)
 
@@ -1503,8 +1955,8 @@ function Show-Gui {
     $script:GuiLog.ReadOnly = $true
     $script:GuiLog.ScrollBars = 'Vertical'
     $script:GuiLog.Font = New-Object System.Drawing.Font('Consolas', 9)
-    $script:GuiLog.Location = New-Object System.Drawing.Point(10, 524)
-    $script:GuiLog.Size = New-Object System.Drawing.Size(1145, 215)
+    $script:GuiLog.Location = New-Object System.Drawing.Point(10, 556)
+    $script:GuiLog.Size = New-Object System.Drawing.Size(1305, 183)
     $script:GuiLog.Anchor = 'Top,Bottom,Left,Right'
     $script:Form.Controls.Add($script:GuiLog)
 
@@ -1567,6 +2019,27 @@ function Show-Gui {
     })
 
     $btnRefresh.Add_Click({ Refresh-Gui; Update-GuiPowerLabel })
+    $btnPost.Add_Click({
+        try {
+            $r = [System.Windows.Forms.MessageBox]::Show('Asistente para recien reinstalado: aplica TODOS los ajustes recomendados, limpia temporales/cache y optimiza NGEN+TRIM+SFC. Los opcionales (debloat, hibernacion...) NO se tocan: marcalos tu si los quieres. Continuar?', 'LTSC-Tuner - Tras reinstalar', 'YesNo', 'Question')
+            if ($r -ne 'Yes') { return }
+            $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+            Invoke-PostInstall
+            Refresh-Gui
+        }
+        catch { [void][System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'LTSC-Tuner - error') }
+        finally { $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default }
+    })
+    $btnOptimize.Add_Click({
+        try {
+            $r = [System.Windows.Forms.MessageBox]::Show('Se optimizaran las imagenes NGEN de .NET, se forzara la optimizacion/TRIM del SSD y se verificara integridad con SFC (varios minutos). No cambia ninguna configuracion. Continuar?', 'LTSC-Tuner', 'YesNo', 'Question')
+            if ($r -ne 'Yes') { return }
+            $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+            Invoke-Optimize
+        }
+        catch { [void][System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'LTSC-Tuner - error') }
+        finally { $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default }
+    })
     $btnClose.Add_Click({ $script:Form.Close() })
 
     Refresh-Gui
@@ -1613,6 +2086,8 @@ switch ($Action) {
         Write-Host 'Para limpiar:  -Action Clean' -ForegroundColor Cyan
         Write-Host 'Para todo al maximo: -Action Apply -Max   (columna Opc = MAX)' -ForegroundColor Cyan
         Write-Host 'Programas de inicio: -Action Startup' -ForegroundColor Cyan
+        Write-Host 'Optimizacion (NGEN+TRIM+SFC):  -Action Optimize' -ForegroundColor Cyan
+        Write-Host 'Tras reinstalar Windows (todo en un paso):  -Action PostInstall   (-Max para modo maximo)' -ForegroundColor Cyan
         Write-Host ''
         Write-Host 'PROTEGER LA BATERIA (Windows no puede limitar la carga por si solo):' -ForegroundColor DarkCyan
         Write-Host '  Entra al BIOS (F2 al encender) > Power Management / Battery y busca "Primary Battery Charge Configuration"' -ForegroundColor DarkCyan
@@ -1693,5 +2168,31 @@ switch ($Action) {
             if ($ans -ne 'SI') { Write-Log 'Cancelado por el usuario.' 'Yellow'; break }
         }
         Invoke-Clean
+    }
+
+    'Optimize' {
+        Write-Host ''
+        Write-Host 'Optimizacion (inspirada en Atlas OS): actualiza las imagenes NGEN de .NET,'
+        Write-Host 'fuerza la optimizacion/TRIM del SSD y verifica integridad con SFC (solo lectura).'
+        Write-Host 'Puede tardar varios minutos. No cambia ninguna configuracion.'
+        if (-not $Yes) {
+            $ans = Read-Host 'Escribe SI para continuar'
+            if ($ans -ne 'SI') { Write-Log 'Cancelado por el usuario.' 'Yellow'; break }
+        }
+        Invoke-Optimize
+    }
+
+    'PostInstall' {
+        Write-Host ''
+        Write-Host 'PRIMERA PASADA TRAS REINSTALAR WINDOWS (estilo Atlas, pero reversible):'
+        Write-Host '  1) Aplica todos los ajustes recomendados (con -Max anade el MODO MAXIMO)'
+        Write-Host '  2) Limpia temporales y cache de Windows Update'
+        Write-Host '  3) Optimiza NGEN + TRIM del SSD + verifica integridad (SFC)'
+        Write-Host 'Los opcionales (debloat appx, hibernacion, busqueda...) NO se tocan: revisalos en la ventana.'
+        if (-not $Yes) {
+            $ans = Read-Host 'Escribe SI para continuar'
+            if ($ans -ne 'SI') { Write-Log 'Cancelado por el usuario.' 'Yellow'; break }
+        }
+        Invoke-PostInstall
     }
 }

@@ -44,9 +44,43 @@ $p = @{
     product      = 'LTSC-Tuner'
     company      = 'LTSC-Tuner'
     description  = 'Ajustes de rendimiento, privacidad y seguridad para Windows 10 LTSC'
-    version      = '5.0.0.0'
+    version      = '6.0.0.0'
 }
 if (-not $Consola) { $p.noConsole = $true }
+
+# Icono propio: si existe LTSC-Tuner.ico en esta carpeta (o en subcarpeta 'assets'),
+# ps2exe lo incrusta en el .exe. Si no existe, se crea uno automatico sencillo
+# (cuadro verde con "T") usando GDI+, para que el ejecutable se vea personalizado.
+$icoCandidates = @(
+    (Join-Path $here 'LTSC-Tuner.ico'),
+    (Join-Path $here 'assets\LTSC-Tuner.ico')
+)
+$iconPath = $icoCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $iconPath) {
+    $iconPath = Join-Path $here 'LTSC-Tuner.ico'
+    Write-Host 'No hay .ico junto al script: generando icono automatico...' -ForegroundColor Cyan
+    Add-Type -AssemblyName System.Drawing
+    $bmp = New-Object System.Drawing.Bitmap 256, 256
+    $g   = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = 'AntiAlias'
+    $g.Clear([System.Drawing.Color]::FromArgb(16, 163, 127))   # verde Atlas
+    $font = New-Object System.Drawing.Font('Segoe UI', 150, [System.Drawing.FontStyle]::Bold)
+    $sf = New-Object System.Drawing.StringFormat
+    $sf.Alignment = 'Center'; $sf.LineAlignment = 'Center'
+    $rect = New-Object System.Drawing.RectangleF 0, 0, 256, 256
+    $g.DrawString('T', $font, [System.Drawing.Brushes]::White, $rect, $sf)
+    $g.Dispose()
+    # SaveGetHIcon necesita un handle; convertir bitmap a icon y guardarlo como .ico
+    $hicon = $bmp.GetHicon()
+    $icn = [System.Drawing.Icon]::FromHandle($hicon)
+    $fs = [System.IO.File]::Create($iconPath)
+    $icn.Save($fs)
+    $fs.Close(); $icn.Dispose(); $bmp.Dispose()
+    # limpiar el handle
+    Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition '[DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);'
+    [void][Win32.NativeMethods]::DestroyIcon($hicon)
+}
+if ($iconPath -and (Test-Path $iconPath)) { $p.icon = $iconPath }
 
 Invoke-ps2exe @p
 
