@@ -76,6 +76,8 @@
    ... -Action Apply -Max                 recomendados + MODO MAXIMO (rendimiento extremo)
    ... -Action Startup                    lista programas de inicio (con -Only "Nombre" los desactiva; -Enable los reactiva)
    ... -Action Optimize                   optimiza NGEN .NET + TRIM del SSD + verifica integridad (SFC)
+   ... -Action PostInstall                primera pasada tras reinstalar Windows: recomendados + limpieza + NGEN/TRIM
+   ... -Action PostInstall -Max           lo mismo pero con MODO MAXIMO (igual que usar el boton despues de instalar)
    ... -Yes                 no pide confirmacion
    ... -NoRestorePoint      no intenta crear punto de restauracion
    ... -ForceUserTweaks     aplica ajustes de usuario aunque la ventana de
@@ -86,7 +88,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Status', 'Apply', 'Undo', 'Clean', 'Startup', 'Optimize')]
+    [ValidateSet('Status', 'Apply', 'Undo', 'Clean', 'Startup', 'Optimize', 'PostInstall')]
     [string]$Action = 'Status',
     [switch]$Gui,
     [switch]$IncludeOptional,
@@ -514,6 +516,86 @@ Add-Custom 'hibernacion-off' 'Rendimiento' 'Medio' 'OPCIONAL: desactiva hibernac
     { cmd /c "powercfg /h off >nul 2>&1" } `
     { param($data) if ($data -eq '1') { cmd /c "powercfg /h on >nul 2>&1" } } `
     $true
+
+# ============================================================================
+#  F) DEBLOAT APPX + SERVICIOS PESADOS (v7.0, inspirado en el playbook de Atlas:
+#     src/playbook/Configuration/debloat.yml y services.yml). NUEVOS IDs: no
+#     afectan tu state.json ni tu Undo actuales.
+#     A diferencia del resto de los ajustes, ESTOS SI eliminan componentes de
+#     la imagen (igual que Atlas). Por eso son OPCIONALES y reversibles asi:
+#     - AppX por usuario: Remove-AppxPackage; Undo = Add-AppxPackage -Register
+#       con el manifest que queda en WindowsApps tras desinstalar para el usuario.
+#     - AppX provisionada: se guarda el listado original en state.json; Undo lo
+#       re-provisiona con Add-AppxProvisionedPackage (DISM).
+#     - Servicios: igual que los demas (StartType original guardado).
+#     En una LTSC limpia casi no hay nada que quitar; si falta algo solo dira
+#     'nada que hacer' o omitira el paquete que no exista.
+# ============================================================================
+
+$script:AppxCatalog = @(
+    'Microsoft.BingNews',
+    'Microsoft.BingWeather',
+    'Microsoft.GetHelp',
+    'Microsoft.Getstarted',
+    'Microsoft.Messaging',
+    'Microsoft.OneConnect',
+    'Microsoft.WindowsFeedbackHub',
+    'Microsoft.MixedReality.Portal',
+    'Microsoft.ZuneMusic',
+    'Microsoft.ZuneVideo',
+    'Microsoft.MicrosoftSolitaireCollection',
+    'Microsoft.People',
+    'Microsoft.PowerAutomateDesktop',
+    'Microsoft.Todos',
+    'Microsoft.YourPhone',
+    'Microsoft.Windows.Phone',
+    'Microsoft.549981C3F5F10'
+)
+
+Add-Custom 'appx-debloat' 'Debloat' 'Medio' 'OPCIONAL (estilo Atlas): quita apps preinstaladas sobrantes (Bing News/Clima, Tu telefono, Feedback Hub, Zune, Solitario, People...). Reversible' `
+    { @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object { $_.Name -in $script:AppxCatalog }).Count -eq 0 } `
+    {
+        $cap = @{}
+        $cap['UserPkgs'] = @(Get-AppxPackage -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -in $script:AppxCatalog } |
+            ForEach-Object { @{ Name = $_.Name; InstallLocation = [string]$_.InstallLocation } })
+        try {
+            $cap['Provisioned'] = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop |
+                Where-Object { $_.DisplayName -in $script:AppxCatalog } |
+                ForEach-Object { @{ DisplayName = $_.DisplayName; PackageName = $_.PackageName } })
+        } catch { $cap['Provisioned'] = @() }
+        ($cap | ConvertTo-Json -Depth 6 -Compress)
+    } `
+    {
+        foreach ($p in @(Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object { $_.Name -in $script:AppxCatalog })) {
+            try { Remove-AppxPackage -Package $p.PackageFullName -ErrorAction Stop } catch { Write-Log ('   appx {0}: no se pudo quitar al usuario ({1})' -f $p.Name, $_.Exception.Message) 'Yellow' }
+        }
+        foreach ($pv in @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -in $script:AppxCatalog })) {
+            try { Remove-AppxProvisionedPackage -Online -PackageName $pv.PackageName -ErrorAction Stop | Out-Null } catch { Write-Log ('   appx prov {0}: {1}' -f $pv.DisplayName, $_.Exception.Message) 'Yellow' }
+        }
+    } `
+    {
+        param($data)
+        if (-not $data) { return }
+        $cap = $data | ConvertFrom-Json
+        # 1) re-provisionar primero (asi el manifest vuelve a estar disponible)
+        foreach ($pv in @($cap.Provisioned)) {
+            try { Add-AppxProvisionedPackage -Online -DisplayName $pv.DisplayName -PackageName $pv.PackageName -ErrorAction Stop | Out-Null } catch { Write-Log ('   re-provision {0}: {1}' -f $pv.DisplayName, $_.Exception.Message) 'Yellow' }
+        }
+        # 2) reinstalar por usuario desde el manifest registrado
+        foreach ($up in @($cap.UserPkgs)) {
+            if (-not $up.InstallLocation) { continue }
+            $man = Join-Path $up.InstallLocation 'AppxManifest.xml'
+            if (Test-Path -LiteralPath $man) {
+                try { Add-AppxPackage -DisableDevelopmentMode -Register $man -ErrorAction Stop | Out-Null } catch { Write-Log ('   re-instalar {0}: {1}' -f $up.Name, $_.Exception.Message) 'Yellow' }
+            }
+        }
+    } `
+    $true
+
+Add-Svc 'svc-printscan' 'Servicios' 'Medio' 'OPCIONAL: desactiva Fax y Escaneo de imagenes (WIA). No escanearas documentos por el equipo' @('Fax', 'WiaRpc') 'Disabled' $true
+Add-Svc 'svc-wlan' 'Servicios' 'Alto' 'OPCIONAL SOLO SIN WI-FI: desactiva Autoconfiguracion de WLAN (el Wi-Fi dejara de funcionar)' @('WlanSvc') 'Disabled' $true
+Add-Svc 'svc-bth' 'Servicios' 'Alto' 'OPCIONAL SOLO SIN BLUETOOTH: desactiva el servicio de Bluetooth' @('bthserv') 'Disabled' $true
 
 Add-Custom 'plan-alto-rendimiento' 'Rendimiento' 'Medio' 'OPCIONAL: plan Alto rendimiento fijo (si usas energia-ac-dc ya no hace falta)' `
     {
@@ -1594,6 +1676,22 @@ function Invoke-Optimize {
 }
 
 # ----------------------------------------------------------------------------
+# Invoke-PostInstall  (-Action PostInstall)
+# La "primera pasada" despues de reinstalar Windows desde cero (tu caso): hace en
+# un solo paso lo que Atlas aplica durante la instalacion, pero sobre el sistema
+# ya instalado: recomendados (o MODO MAXIMO con -Max) + limpieza + NGEN/TRIM.
+# Si usas la ventana, el boton "Tras reinstalar" hace exactamente esto.
+# ----------------------------------------------------------------------------
+function Invoke-PostInstall {
+    Write-Log ('--- LTSC-Tuner v{0}: primera pasada tras reinstalar ---' -f $ToolVersion) 'Cyan'
+    $sel = @($Tweaks | Where-Object { (-not $_.Optional) -or ($Max -and $_.Max) })
+    Invoke-ApplyList $sel
+    Invoke-Clean
+    Invoke-Optimize
+    Write-Log 'Pasada completa. Reinicia el equipo, instala los drivers de Dell (chipset, video, red) desde dell.com/support y vuelve a correr este asistente si quieres ajustar algo mas.' 'Cyan'
+}
+
+# ----------------------------------------------------------------------------
 # Programas de inicio (se desactivan igual que en el Administrador de tareas; reversible)
 # ----------------------------------------------------------------------------
 function New-StartupObj {
@@ -1838,6 +1936,13 @@ function Show-Gui {
     $btnOptimize.Size = New-Object System.Drawing.Size(150, 32)
     $script:Form.Controls.Add($btnOptimize)
 
+    $btnPost = New-Object System.Windows.Forms.Button
+    $btnPost.Text = 'Tras reinstalar'
+    $btnPost.Location = New-Object System.Drawing.Point(990, 518)
+    $btnPost.Size = New-Object System.Drawing.Size(150, 32)
+    $btnPost.ForeColor = [System.Drawing.Color]::DarkBlue
+    $script:Form.Controls.Add($btnPost)
+
     $btnClose = New-Object System.Windows.Forms.Button
     $btnClose.Text = 'Cerrar'
     $btnClose.Location = New-Object System.Drawing.Point(1146, 482)
@@ -1850,8 +1955,8 @@ function Show-Gui {
     $script:GuiLog.ReadOnly = $true
     $script:GuiLog.ScrollBars = 'Vertical'
     $script:GuiLog.Font = New-Object System.Drawing.Font('Consolas', 9)
-    $script:GuiLog.Location = New-Object System.Drawing.Point(10, 524)
-    $script:GuiLog.Size = New-Object System.Drawing.Size(1305, 215)
+    $script:GuiLog.Location = New-Object System.Drawing.Point(10, 556)
+    $script:GuiLog.Size = New-Object System.Drawing.Size(1305, 183)
     $script:GuiLog.Anchor = 'Top,Bottom,Left,Right'
     $script:Form.Controls.Add($script:GuiLog)
 
@@ -1914,6 +2019,17 @@ function Show-Gui {
     })
 
     $btnRefresh.Add_Click({ Refresh-Gui; Update-GuiPowerLabel })
+    $btnPost.Add_Click({
+        try {
+            $r = [System.Windows.Forms.MessageBox]::Show('Asistente para recien reinstalado: aplica TODOS los ajustes recomendados, limpia temporales/cache y optimiza NGEN+TRIM+SFC. Los opcionales (debloat, hibernacion...) NO se tocan: marcalos tu si los quieres. Continuar?', 'LTSC-Tuner - Tras reinstalar', 'YesNo', 'Question')
+            if ($r -ne 'Yes') { return }
+            $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+            Invoke-PostInstall
+            Refresh-Gui
+        }
+        catch { [void][System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'LTSC-Tuner - error') }
+        finally { $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default }
+    })
     $btnOptimize.Add_Click({
         try {
             $r = [System.Windows.Forms.MessageBox]::Show('Se optimizaran las imagenes NGEN de .NET, se forzara la optimizacion/TRIM del SSD y se verificara integridad con SFC (varios minutos). No cambia ninguna configuracion. Continuar?', 'LTSC-Tuner', 'YesNo', 'Question')
@@ -1971,6 +2087,7 @@ switch ($Action) {
         Write-Host 'Para todo al maximo: -Action Apply -Max   (columna Opc = MAX)' -ForegroundColor Cyan
         Write-Host 'Programas de inicio: -Action Startup' -ForegroundColor Cyan
         Write-Host 'Optimizacion (NGEN+TRIM+SFC):  -Action Optimize' -ForegroundColor Cyan
+        Write-Host 'Tras reinstalar Windows (todo en un paso):  -Action PostInstall   (-Max para modo maximo)' -ForegroundColor Cyan
         Write-Host ''
         Write-Host 'PROTEGER LA BATERIA (Windows no puede limitar la carga por si solo):' -ForegroundColor DarkCyan
         Write-Host '  Entra al BIOS (F2 al encender) > Power Management / Battery y busca "Primary Battery Charge Configuration"' -ForegroundColor DarkCyan
@@ -2063,5 +2180,19 @@ switch ($Action) {
             if ($ans -ne 'SI') { Write-Log 'Cancelado por el usuario.' 'Yellow'; break }
         }
         Invoke-Optimize
+    }
+
+    'PostInstall' {
+        Write-Host ''
+        Write-Host 'PRIMERA PASADA TRAS REINSTALAR WINDOWS (estilo Atlas, pero reversible):'
+        Write-Host '  1) Aplica todos los ajustes recomendados (con -Max anade el MODO MAXIMO)'
+        Write-Host '  2) Limpia temporales y cache de Windows Update'
+        Write-Host '  3) Optimiza NGEN + TRIM del SSD + verifica integridad (SFC)'
+        Write-Host 'Los opcionales (debloat appx, hibernacion, busqueda...) NO se tocan: revisalos en la ventana.'
+        if (-not $Yes) {
+            $ans = Read-Host 'Escribe SI para continuar'
+            if ($ans -ne 'SI') { Write-Log 'Cancelado por el usuario.' 'Yellow'; break }
+        }
+        Invoke-PostInstall
     }
 }
